@@ -1,0 +1,133 @@
+name: comment-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number in this repository"
+        required: true
+        default: "1"
+        type: string
+      source_ref:
+        description: "gh-dependency-risk ref to build"
+        required: true
+        default: "main"
+        type: string
+      lang:
+        description: "Output language"
+        required: false
+        default: en
+        type: choice
+        options:
+          - ko
+          - en
+      no_registry:
+        description: "Skip npm registry lookups"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+jobs:
+  comment-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gh-dependency-risk
+        uses: actions/checkout@v5
+        with:
+          repository: rad1092/gh-dependency-risk
+          ref: ${{ inputs.source_ref }}
+          path: tool
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: tool/go.mod
+
+      - name: Test gh-dep-risk
+        working-directory: tool
+        run: go test ./...
+
+      - name: Set build metadata
+        shell: bash
+        run: |
+          cd tool
+          echo "BUILD_VERSION=comment-smoke-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "BUILD_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Build gh-dep-risk
+        working-directory: tool
+        shell: bash
+        run: >
+          go build
+          -ldflags "-s -w -X gh-dep-risk/cmd.version=${BUILD_VERSION} -X gh-dep-risk/cmd.commit=${BUILD_COMMIT} -X gh-dep-risk/cmd.date=${BUILD_DATE}"
+          -o gh-dep-risk
+          .
+
+      - name: Run comment smoke
+        id: dep_risk
+        working-directory: tool
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PR: ${{ inputs.pr }}
+          INPUT_LANG: ${{ inputs.lang }}
+          INPUT_NO_REGISTRY: ${{ inputs.no_registry }}
+        run: |
+          set +e
+
+          bundle_dir="$RUNNER_TEMP/dep-risk-bundle"
+          rm -rf "$bundle_dir"
+
+          args=(
+            pr
+            "$INPUT_PR"
+            --repo "$GITHUB_REPOSITORY"
+            --lang "$INPUT_LANG"
+            --comment
+            --bundle-dir "$bundle_dir"
+          )
+
+          if [[ "$INPUT_NO_REGISTRY" == 'true' ]]; then
+            args+=(--no-registry)
+          fi
+
+          ./gh-dep-risk "${args[@]}"
+          exit_code=$?
+
+          echo "bundle_dir=$bundle_dir" >> "$GITHUB_OUTPUT"
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Append markdown summary
+        if: always()
+        shell: bash
+        run: |
+          bundle_dir='${{ steps.dep_risk.outputs.bundle_dir }}'
+          if [[ -f "$bundle_dir/dep-risk.md" ]]; then
+            cat "$bundle_dir/dep-risk.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "gh-dep-risk did not produce a markdown bundle." >> "$GITHUB_STEP_SUMMARY"
+            echo "CLI exit code: ${{ steps.dep_risk.outputs.exit_code }}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload dep-risk bundle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dep-risk-bundle
+          path: ${{ steps.dep_risk.outputs.bundle_dir }}
+          if-no-files-found: warn
+
+      - name: Surface dep-risk exit code
+        if: always() && steps.dep_risk.outputs.exit_code != '' && steps.dep_risk.outputs.exit_code != '0'
+        shell: bash
+        run: |
+          echo "gh-dep-risk exited with code ${{ steps.dep_risk.outputs.exit_code }}" >&2
+          exit "${{ steps.dep_risk.outputs.exit_code }}"
